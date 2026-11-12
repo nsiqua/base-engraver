@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Urn Base Engraver</title>
+<title>Pet Urn Engraver</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   :root { --bg:#16181d; --panel:#20232a; --text:#e8e8ea; --muted:#9aa0aa; --accent:#4f8cff; --err:#ff6b6b; }
@@ -12,14 +12,15 @@
   aside { background:var(--panel); padding:24px; display:flex; flex-direction:column; gap:14px; }
   h1 { font-size:20px; margin:0 0 4px; }
   p.sub { margin:0; color:var(--muted); font-size:13px; line-height:1.4; }
-  label { font-size:13px; color:var(--muted); }
-  input { width:100%; padding:12px; font-size:18px; border-radius:8px; border:1px solid #3a3f4b;
-          background:#14161a; color:var(--text); letter-spacing:1px; }
+  label { font-size:13px; color:var(--muted); display:block; margin-bottom:5px; }
+  input, select { width:100%; padding:11px 12px; font-size:16px; border-radius:8px; border:1px solid #3a3f4b;
+                  background:#14161a; color:var(--text); }
+  input { font-size:18px; letter-spacing:1px; }
   .count { font-size:12px; color:var(--muted); text-align:right; margin-top:4px; }
   button { padding:12px; font-size:15px; border:0; border-radius:8px; cursor:pointer; font-weight:600; }
   #previewBtn { background:#343a46; color:var(--text); }
   #downloadBtn { background:var(--accent); color:white; }
-  button:disabled { opacity:.45; cursor:default; }
+  button:disabled, input:disabled, select:disabled { opacity:.45; cursor:default; }
   #status { font-size:13px; min-height:36px; color:var(--muted); line-height:1.4; }
   #status.err { color:var(--err); }
   .specs { font-size:12px; color:var(--muted); border-top:1px solid #333844; padding-top:12px; line-height:1.6; margin-top:auto; }
@@ -31,8 +32,15 @@
 <body>
 <aside>
   <div>
-    <h1>Urn Base Engraver</h1>
-    <p class="sub">Type a name, preview it, then download the full-quality engraved STL.</p>
+    <h1>Pet Urn Engraver</h1>
+    <p class="sub">Select a model, enter a name, preview it in 3D, and download the full-quality engraved STL.</p>
+  </div>
+  <div>
+    <label for="modelSelect">Model</label>
+    <select id="modelSelect">
+      <option value="cat" selected>Domestic Shorthair Cat Urn (Complete)</option>
+      <option value="base">Blank Base Only (with Screw)</option>
+    </select>
   </div>
   <div>
     <label for="text">Engraving text</label>
@@ -41,17 +49,17 @@
   </div>
   <button id="previewBtn">Preview</button>
   <button id="downloadBtn">Generate &amp; download STL</button>
-  <div id="status">Loading base model…</div>
+  <div id="status">Loading models…</div>
   <div class="specs">
     Font: Arial (mixed case &amp; accents)<br>
     Max height: 10 mm · Cut depth: 1 mm<br>
-    Position: outer wall, centred on the +Y side<br>
+    Alignment: symmetrical under cat's face<br>
     Max 15 characters
   </div>
 </aside>
 <main>
   <canvas id="view"></canvas>
-  <div class="note">Preview uses a simplified base shape. The download uses the original full-quality mesh.</div>
+  <div class="note">Preview uses a lightweight mesh for speed. The download exports the original full-resolution STL.</div>
 </main>
 
 <script type="importmap">
@@ -66,7 +74,7 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { STLLoader } from "three/addons/loaders/STLLoader.js";
 
 const $ = (id) => document.getElementById(id);
-const input = $("text"), status = $("status");
+const input = $("text"), modelSelect = $("modelSelect"), status = $("status");
 const previewBtn = $("previewBtn"), downloadBtn = $("downloadBtn");
 
 // ---------- 3D view (Z up, like a slicer)
@@ -75,20 +83,32 @@ const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
 renderer.setPixelRatio(window.devicePixelRatio);
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x2a2d34);
-const camera = new THREE.PerspectiveCamera(35, 1, 1, 2000);
+const camera = new THREE.PerspectiveCamera(35, 1, 1, 2500);
 camera.up.set(0, 0, 1);
-camera.position.set(0, 190, 110);
 const controls = new OrbitControls(camera, canvas);
-controls.target.set(0, 0, 0);
 scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.6));
 const dir = new THREE.DirectionalLight(0xffffff, 1.8);
-dir.position.set(60, 150, 120);
+dir.position.set(60, 180, 140);
 scene.add(dir);
 const grid = new THREE.GridHelper(220, 22, 0x555a66, 0x3a3e47);
-grid.rotation.x = Math.PI / 2; grid.position.z = -5.8;
+grid.rotation.x = Math.PI / 2;
 scene.add(grid);
 const material = new THREE.MeshStandardMaterial({ color: 0xeeeeee, roughness: 0.55, metalness: 0.0 });
 let mesh = null;
+
+function setCameraForModel(model) {
+  if (model === "cat") {
+    grid.position.z = 0.0;
+    controls.target.set(0, 0, 58);
+    camera.position.set(0, 290, 105);
+  } else {
+    grid.position.z = -5.8;
+    controls.target.set(0, 0, 0);
+    camera.position.set(0, 190, 110);
+  }
+  controls.update();
+}
+setCameraForModel(modelSelect.value);
 
 function resize() {
   const w = canvas.parentElement.clientWidth, h = canvas.parentElement.clientHeight;
@@ -97,25 +117,31 @@ function resize() {
 window.addEventListener("resize", resize); resize();
 (function loop() { controls.update(); renderer.render(scene, camera); requestAnimationFrame(loop); })();
 
-function showStl(buffer) {
+function showStl(buffer, model) {
   const geom = new STLLoader().parse(buffer);
   geom.computeVertexNormals();
   if (mesh) { scene.remove(mesh); mesh.geometry.dispose(); }
   mesh = new THREE.Mesh(geom, material);
   scene.add(mesh);
+  setCameraForModel(model);
 }
 
 // ---------- UI
 function setStatus(msg, err = false) { status.textContent = msg; status.className = err ? "err" : ""; }
-function busy(b) { previewBtn.disabled = downloadBtn.disabled = b; input.disabled = b; }
+function busy(b) { previewBtn.disabled = downloadBtn.disabled = b; input.disabled = modelSelect.disabled = b; }
 input.addEventListener("input", () => { $("count").textContent = input.value.length; });
 input.addEventListener("keydown", (e) => { if (e.key === "Enter") preview(); });
+modelSelect.addEventListener("change", () => {
+  setCameraForModel(modelSelect.value);
+  if (input.value.trim()) preview();
+});
 
 async function call(endpoint) {
   const text = input.value.trim();
+  const model = modelSelect.value;
   if (!text) { setStatus("Please enter some text.", true); return null; }
   const res = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json" },
-                                      body: JSON.stringify({ text }) });
+                                      body: JSON.stringify({ text, model }) });
   if (!res.ok) {
     let msg = res.statusText;
     try { msg = (await res.json()).error; } catch {}
@@ -125,27 +151,32 @@ async function call(endpoint) {
 }
 
 async function preview() {
+  const model = modelSelect.value;
   busy(true); setStatus("Building preview…");
   try {
     const res = await call("/api/preview");
-    if (res) { showStl(await res.arrayBuffer()); setStatus("Preview ready. Drag to rotate, scroll to zoom."); }
+    if (res) { showStl(await res.arrayBuffer(), model); setStatus("Preview ready. Drag to rotate, scroll to zoom."); }
   } catch (e) { setStatus(e.message, true); }
   busy(false);
 }
 
 async function download() {
-  busy(true); setStatus("Engraving the full-quality model (about 10–30 s, ~176 MB)…");
+  const model = modelSelect.value;
+  const sizeHint = model === "cat" ? "~376 MB" : "~183 MB";
+  busy(true); setStatus(`Engraving the full-quality model (${sizeHint})…`);
   const t0 = performance.now();
   try {
     const res = await call("/api/engrave");
     if (res) {
       const name = decodeURIComponent(res.headers.get("X-Text") || "engraved").replace(/ /g, "_");
+      const prefix = model === "cat" ? "Cat_Urn" : "Base";
+      const fileName = `${prefix}_${name}.stl`;
       const blob = await res.blob();
       const a = document.createElement("a");
-      a.href = URL.createObjectURL(blob); a.download = `Base_${name}.stl`;
+      a.href = URL.createObjectURL(blob); a.download = fileName;
       document.body.appendChild(a); a.click(); a.remove();
       setTimeout(() => URL.revokeObjectURL(a.href), 60000);
-      setStatus(`Downloaded Base_${name}.stl (${(blob.size / 1e6).toFixed(1)} MB) in ${((performance.now() - t0) / 1000).toFixed(1)} s.`);
+      setStatus(`Downloaded ${fileName} (${(blob.size / 1e6).toFixed(1)} MB) in ${((performance.now() - t0) / 1000).toFixed(1)} s.`);
     }
   } catch (e) { setStatus(e.message, true); }
   busy(false);
@@ -153,7 +184,7 @@ async function download() {
 previewBtn.onclick = preview;
 downloadBtn.onclick = download;
 
-// wait until the server has loaded the base model
+// wait until the server has loaded the models
 busy(true);
 (async function poll() {
   try {

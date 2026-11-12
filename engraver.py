@@ -1,7 +1,10 @@
 """Core engraving logic: wraps text around the outer wall of the urn base and cuts it in.
 
-All units are millimetres. The base is assumed to be a ring centred on the Z axis
-(verified for "Base with Screw2.stl": centre (0, 0), outer radius 49.68, Z -5.80..6.00).
+Supports both:
+- "cat":  Domestic ShortHair_Complete_Blank.stl (full cat urn + base, text symmetrical to the cat's face)
+- "base": Base with Screw2.stl (standalone threaded base ring)
+
+All units are millimetres.
 """
 from __future__ import annotations
 
@@ -20,15 +23,17 @@ from matplotlib.textpath import TextPath
 
 # ---------------------------------------------------------------- settings
 BASE_STL = Path(__file__).with_name("Base with Screw2.stl")
+CAT_STL = Path(__file__).with_name("Domestic ShortHair_Complete_Blank.stl")
 FONT_FILE = Path(r"C:\Windows\Fonts\arial.ttf")
-CAP_HEIGHT = 10.0      # mm, height of capital letters (user choice "B")
+CAP_HEIGHT = 10.0      # mm, max height of letters (standard capital 'H' height = 10 mm)
 DEPTH = 1.0            # mm, cut depth measured along the surface normal (uniform, incl. rounded top edge)
 MAX_CHARS = 15
 OVERSHOOT = 1.0        # mm the cutter sticks out beyond the wall (clean cut)
 EDGE_MARGIN = 0.05     # mm, letters must stay at least this far from top/bottom faces
 REFINE_LEN = 0.4       # mm, max edge length before wrapping (smooth curvature)
-FRONT_ANGLE = 0.0      # radians; 0 = text centred on the +Y side
+FRONT_ANGLE = 0.0      # radians; 0 = text centred on the +Y side of Base with Screw2.stl
 
+_STL_DTYPE = np.dtype([("n", "<f4", 3), ("v", "<f4", (3, 3)), ("a", "<u2")])
 _FONT_PROPS = FontProperties(fname=str(FONT_FILE))
 _CMAP = TTFont(str(FONT_FILE))["cmap"].getBestCmap()
 _LOCK = threading.Lock()
@@ -38,11 +43,11 @@ class EngraveError(ValueError):
     """Raised for user-input problems (shown to the user)."""
 
 
-# ---------------------------------------------------------------- base model
+# ---------------------------------------------------------------- base & cat models
 class Base:
-    def __init__(self, path: Path):
+    def __init__(self, base_path: Path, cat_path: Path):
         t = time.time()
-        tm = trimesh.load(str(path), process=True)
+        tm = trimesh.load(str(base_path), process=True)
         verts = np.asarray(tm.vertices, dtype=np.float32)
         faces = np.asarray(tm.faces, dtype=np.uint32)
         self.manifold = m3d.Manifold(m3d.Mesh(vert_properties=verts, tri_verts=faces))
@@ -58,6 +63,11 @@ class Base:
         self.preview = self._preview_shape()
         print(f"[base] loaded {self.manifold.num_tri():,} triangles in {time.time() - t:.1f}s; "
               f"R={self.r_outer:.3f} Z={self.z_min:.3f}..{self.z_max:.3f}")
+
+        # Load Cat Urn if present
+        self.has_cat = cat_path.exists()
+        if self.has_cat:
+            self._load_cat(cat_path, len(faces))
 
     def _outer_profile(self, z: np.ndarray, r: np.ndarray) -> None:
         """Measure the outer wall profile r(z), including the rounded top edge.
@@ -93,6 +103,94 @@ class Base:
         outer = np.column_stack([rmax, zc])[::-1]
         profile = m3d.CrossSection([np.vstack([inner, outer])], m3d.FillRule.NonZero)
         return m3d.Manifold.revolve(profile, 360)
+
+    def _load_cat(self, cat_path: Path, n_base_tris: int) -> None:
+        """Load the full Cat Urn STL, extract non-base shells untouched, detect face symmetry,
+        and build a lightweight decimated cat mesh for fast browser previewing.
+        """
+        t0 = time.time()
+        with open(cat_path, "rb") as f:
+            head = f.read(84)
+            n_total = struct.unpack("<I", head[80:84])[0]
+            raw = np.fromfile(f, dtype=_STL_DTYPE, count=n_total)
+
+        # In Domestic ShortHair_Complete_Blank.stl:
+        #   indices [0 : 3,858,582]         -> cat body & fragments
+        #   indices [3,858,582 : 7,538,308] -> exact base ring (rotated -90° in XY, shifted +(128, 128, 5.797501))
+        #   indices [7,538,308 : 7,538,564] -> 256-tri inner plug disc
+        n_disc = 256
+        n_cat_body = n_total - n_base_tris - n_disc
+        self.cat_body_records = raw[:n_cat_body].copy()
+        self.cat_disc_records = raw[n_cat_body + n_base_tris:].copy()
+        self.cat_center_xy = np.array([128.0, 128.0], dtype=np.float32)
+        self.cat_z_shift = float(-self.z_min)  # +5.79750109 mm so base bottom is at Z = 0
+
+        # Detect the cat's face direction from the two ear tips + muzzle protrusion
+        v0 = self.cat_body_records["v"][:, 0, :].astype(np.float64)
+        v0[:, 0] -= 128.0
+        v0[:, 1] -= 128.0
+        z = v0[:, 2]
+        top = v0[z > z.max() - 12.0]
+        c = np.array([top[top[:, 0].argmin(), :2], top[top[:, 0].argmax(), :2]])
+        for _ in range(30):
+            lab = np.argmin(((top[:, None, :2] - c[None]) ** 2).sum(-1), axis=1)
+            c = np.array([top[lab == k, :2].mean(0) for k in range(2)])
+        tips = np.array([top[lab == k][top[lab == k][:, 2].argmax()] for k in range(2)])
+        mid = tips.mean(0)
+        ear_vec = tips[1, :2] - tips[0, :2]
+        ear_vec /= np.linalg.norm(ear_vec)
+        n = np.array([-ear_vec[1], ear_vec[0]])  # perpendicular in XY
+        # Pick the side where the forehead/nose (Z 100..120) extends furthest from the base axis
+        forehead = v0[(z > 100.0) & (z < 120.0), :2]
+        if (forehead @ n).max() < (forehead @ (-n)).max():
+            n = -n
+        # Where the head's mid-plane (through `mid` along `n`) intersects the base outer wall (R = r_outer)
+        b_coef = float(mid[:2] @ n)
+        c_coef = float(mid[:2] @ mid[:2] - self.r_outer ** 2)
+        hit = mid[:2] + (-b_coef + np.sqrt(b_coef * b_coef - c_coef)) * n
+        self.cat_face_azimuth_deg = float(np.degrees(np.arctan2(n[1], n[0])))
+        self.cat_text_azimuth_rad = float(np.arctan2(hit[1], hit[0]))
+        # In Base local frame (before the -90° XY rotation that maps Base -> Cat):
+        # A point at angle `theta` in `wrap()` has Base XY (-r sin(theta), r cos(theta)),
+        # which maps to Cat XY (r cos(theta), r sin(theta)), i.e. Cat azimuth = `theta`!
+        self.cat_front_angle = float(self.cat_text_azimuth_rad)
+
+        # Build a seamless vertex-clustered preview mesh of the cat body + disc
+        self.cat_preview_records = self._decimate_cat_for_preview(
+            np.concatenate([self.cat_body_records, self.cat_disc_records]), grid=0.85
+        )
+        print(f"[cat] loaded {len(self.cat_body_records):,} cat tris + {len(self.cat_disc_records)} disc tris, "
+              f"face azimuth={self.cat_face_azimuth_deg:+.2f}°, preview={len(self.cat_preview_records):,} tris "
+              f"in {time.time() - t0:.1f}s")
+
+    @staticmethod
+    def _decimate_cat_for_preview(records: np.ndarray, grid: float = 0.85) -> np.ndarray:
+        """Fast vectorized vertex-clustering decimation for smooth browser previewing."""
+        v = records["v"].copy()
+        v[:, :, 0] -= 128.0
+        v[:, :, 1] -= 128.0
+        q = np.round(v / grid).astype(np.int64)
+        flat_q = q.reshape(-1, 3)
+        flat_v = v.reshape(-1, 3).astype(np.float64)
+        keys = (flat_q[:, 0] + 1000) * 1_000_000 + (flat_q[:, 1] + 1000) * 1_000 + (flat_q[:, 2] + 1000)
+        _, inv = np.unique(keys, return_inverse=True)
+        counts = np.bincount(inv)
+        avg_v = np.column_stack([np.bincount(inv, flat_v[:, i]) / counts for i in range(3)]).astype(np.float32)
+
+        tri_idx = inv.reshape(-1, 3)
+        keep = (tri_idx[:, 0] != tri_idx[:, 1]) & (tri_idx[:, 1] != tri_idx[:, 2]) & (tri_idx[:, 2] != tri_idx[:, 0])
+        tri_idx = tri_idx[keep]
+        s_tri = np.sort(tri_idx, axis=1)
+        _, u_idx = np.unique(s_tri, axis=0, return_index=True)
+        tri_idx = tri_idx[np.sort(u_idx)]
+
+        tri_v = avg_v[tri_idx]
+        n = np.cross(tri_v[:, 1] - tri_v[:, 0], tri_v[:, 2] - tri_v[:, 0])
+        ln = np.linalg.norm(n, axis=1, keepdims=True)
+        n = np.divide(n, ln, out=np.zeros_like(n), where=ln > 0)
+        rec = np.zeros(len(tri_v), dtype=_STL_DTYPE)
+        rec["n"], rec["v"] = n, tri_v
+        return rec
 
 
 # ---------------------------------------------------------------- text cutter
@@ -133,7 +231,8 @@ def _text_polygons(text: str) -> list[np.ndarray]:
     return [p - [cx, 0.0] for p in polys]
 
 
-def build_cutter(text: str, base: Base) -> m3d.Manifold:
+def build_cutter(text: str, base: Base, front_angle: float = FRONT_ANGLE,
+                 arc_dir: float = 1.0) -> m3d.Manifold:
     polys = _text_polygons(text)
     allp = np.vstack(polys)
 
@@ -150,6 +249,9 @@ def build_cutter(text: str, base: Base) -> m3d.Manifold:
         raise EngraveError("Text is too wide to fit around the base.")
 
     section = m3d.CrossSection(polys, m3d.FillRule.NonZero)
+    if arc_dir < 0:
+        # Mirror x before extruding so triangle winding stays outward-facing when theta decreases with x
+        section = section.scale([-1.0, 1.0])
     solid = section.extrude(DEPTH + OVERSHOOT).refine_to_length(REFINE_LEN)
 
     R = base.r_outer
@@ -157,7 +259,7 @@ def build_cutter(text: str, base: Base) -> m3d.Manifold:
     def wrap(v: np.ndarray) -> np.ndarray:
         # x: along the text, y: up, t: 0..DEPTH+OVERSHOOT through the wall (t=DEPTH is the surface)
         x, y, t = v[:, 0], v[:, 1], v[:, 2]
-        theta = FRONT_ANGLE + x / R          # arc length measured on the outer wall
+        theta = front_angle + x / R          # arc length measured on the outer wall
         z = y + y_shift
         # point on the actual surface (follows the rounded top edge) ...
         r_s = np.interp(z, base.prof_z, base.prof_r)
@@ -168,7 +270,7 @@ def build_cutter(text: str, base: Base) -> m3d.Manifold:
         s = t - DEPTH
         rad = r_s + s * n_r
         out = np.empty_like(v)
-        out[:, 0] = -rad * np.sin(theta)     # reads left-to-right when viewed from +Y
+        out[:, 0] = -rad * np.sin(theta)     # reads left-to-right when viewed from front_angle
         out[:, 1] = rad * np.cos(theta)
         out[:, 2] = z + s * n_z
         return out
@@ -177,7 +279,7 @@ def build_cutter(text: str, base: Base) -> m3d.Manifold:
 
 
 # ---------------------------------------------------------------- STL export
-def to_stl_bytes(man: m3d.Manifold, name: str = "engraved") -> bytes:
+def _manifold_to_records(man: m3d.Manifold) -> np.ndarray:
     mesh = man.to_mesh()
     v = np.asarray(mesh.vert_properties, dtype=np.float32)[:, :3]
     f = np.asarray(mesh.tri_verts, dtype=np.int64)
@@ -185,13 +287,46 @@ def to_stl_bytes(man: m3d.Manifold, name: str = "engraved") -> bytes:
     n = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
     ln = np.linalg.norm(n, axis=1, keepdims=True)
     n = np.divide(n, ln, out=np.zeros_like(n), where=ln > 0)
-    rec = np.zeros(len(f), dtype=np.dtype([("n", "<f4", 3), ("v", "<f4", (3, 3)), ("a", "<u2")]))
+    rec = np.zeros(len(f), dtype=_STL_DTYPE)
     rec["n"], rec["v"] = n, tri
+    return rec
+
+
+def _records_to_stl_bytes(rec: np.ndarray, header_text: str) -> bytes:
     buf = io.BytesIO()
-    buf.write(f"Engraved base: {name}".encode("ascii", "replace")[:80].ljust(80, b" "))
-    buf.write(struct.pack("<I", len(f)))
+    buf.write(header_text.encode("ascii", "replace")[:80].ljust(80, b" "))
+    buf.write(struct.pack("<I", len(rec)))
     buf.write(rec.tobytes())
     return buf.getvalue()
+
+
+def _transform_base_records_to_cat_space(rec: np.ndarray, z_shift: float, xy_shift: float = 0.0) -> np.ndarray:
+    """Apply the exact rigid transform that maps Base with Screw2.stl into Cat STL space:
+    (x, y, z) -> (y + xy_shift, -x + xy_shift, z + z_shift).
+    """
+    out = rec.copy()
+    vx, vy = out["v"][:, :, 0].copy(), out["v"][:, :, 1].copy()
+    out["v"][:, :, 0] = vy + xy_shift
+    out["v"][:, :, 1] = -vx + xy_shift
+    out["v"][:, :, 2] += z_shift
+    nx, ny = out["n"][:, 0].copy(), out["n"][:, 1].copy()
+    out["n"][:, 0] = ny
+    out["n"][:, 1] = -nx
+    return out
+
+
+def _rotate_cat_records_to_front(rec: np.ndarray, angle_rad: float, center_xy: float = 0.0) -> np.ndarray:
+    """Rotate records in XY around (center_xy, center_xy) by angle_rad."""
+    out = rec.copy()
+    c, s = np.float32(np.cos(angle_rad)), np.float32(np.sin(angle_rad))
+    vx = out["v"][:, :, 0] - center_xy
+    vy = out["v"][:, :, 1] - center_xy
+    out["v"][:, :, 0] = c * vx - s * vy + center_xy
+    out["v"][:, :, 1] = s * vx + c * vy + center_xy
+    nx, ny = out["n"][:, 0].copy(), out["n"][:, 1].copy()
+    out["n"][:, 0] = c * nx - s * ny
+    out["n"][:, 1] = s * nx + c * ny
+    return out
 
 
 # ---------------------------------------------------------------- public API
@@ -202,27 +337,60 @@ def get_base() -> Base:
     global _base
     with _LOCK:
         if _base is None:
-            _base = Base(BASE_STL)
+            _base = Base(BASE_STL, CAT_STL)
         return _base
 
 
-def engrave(text: str, preview: bool = False) -> tuple[str, bytes]:
+def engrave(text: str, preview: bool = False, model: str = "cat") -> tuple[str, bytes]:
     text = normalise_text(text)
     base = get_base()
+    if model == "cat" and not base.has_cat:
+        raise EngraveError(f"Cat model file not found: {CAT_STL.name}")
+
     t = time.time()
-    cutter = build_cutter(text, base)
+    front_angle = base.cat_front_angle if model == "cat" else FRONT_ANGLE
+    cutter = build_cutter(text, base, front_angle=front_angle, arc_dir=1.0)
     target = base.preview if preview else base.manifold
     with _LOCK:
         result = target - cutter
-        data = to_stl_bytes(result, text)
-    print(f"[engrave] {'preview' if preview else 'full'} '{text}': "
-          f"{result.num_tri():,} tris, {len(data) / 1e6:.1f} MB, {time.time() - t:.1f}s")
+        base_rec = _manifold_to_records(result)
+
+    if model == "cat":
+        if preview:
+            # In preview: centre at (0, 0) and rotate so the cat & engraving face +Y (towards the camera)
+            base_cat = _transform_base_records_to_cat_space(base_rec, z_shift=base.cat_z_shift, xy_shift=0.0)
+            combined = np.concatenate([base.cat_preview_records, base_cat])
+            rot_to_plus_y = (np.pi / 2) - base.cat_text_azimuth_rad
+            combined = _rotate_cat_records_to_front(combined, rot_to_plus_y, center_xy=0.0)
+            data = _records_to_stl_bytes(combined, f"Preview Cat Urn: {text}")
+            n_tris = len(combined)
+        else:
+            # Full export: exact original Cat STL coordinate space and untouched cat/disc shells
+            base_cat = _transform_base_records_to_cat_space(base_rec, z_shift=base.cat_z_shift, xy_shift=128.0)
+            total_tris = len(base.cat_body_records) + len(base_cat) + len(base.cat_disc_records)
+            buf = io.BytesIO()
+            buf.write(f"Engraved Cat Urn: {text}".encode("ascii", "replace")[:80].ljust(80, b" "))
+            buf.write(struct.pack("<I", total_tris))
+            buf.write(base.cat_body_records.tobytes())
+            buf.write(base_cat.tobytes())
+            buf.write(base.cat_disc_records.tobytes())
+            data = buf.getvalue()
+            n_tris = total_tris
+    else:
+        data = _records_to_stl_bytes(base_rec, f"Engraved base: {text}")
+        n_tris = len(base_rec)
+
+    print(f"[engrave] {model} {'preview' if preview else 'full'} '{text}': "
+          f"{n_tris:,} tris, {len(data) / 1e6:.1f} MB, {time.time() - t:.1f}s")
     return text, data
 
 
-if __name__ == "__main__":  # quick CLI test:  python engraver.py "Charlie"
+if __name__ == "__main__":  # quick CLI test:  python engraver.py "Charlie" [cat|base]
     import sys
-    name, stl = engrave(sys.argv[1] if len(sys.argv) > 1 else "Charlie")
-    out = Path(__file__).with_name(f"Base_{name.replace(' ', '_')}.stl")
+    arg_text = sys.argv[1] if len(sys.argv) > 1 else "Charlie"
+    arg_model = sys.argv[2] if len(sys.argv) > 2 else "cat"
+    name, stl = engrave(arg_text, model=arg_model)
+    prefix = "Cat_Urn" if arg_model == "cat" else "Base"
+    out = Path(__file__).with_name(f"{prefix}_{name.replace(' ', '_')}.stl")
     out.write_bytes(stl)
     print("wrote", out)

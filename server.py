@@ -1,4 +1,4 @@
-"""Tiny local web server for the base engraver (Python standard library only).
+"""Tiny local web server for the urn engraver (Python standard library only).
 
 Run:   python server.py      then open http://localhost:8000
 """
@@ -31,6 +31,10 @@ def _current_engraver():
                 r = (v[:, 0] ** 2 + v[:, 1] ** 2) ** 0.5
                 cached_base._outer_profile(v[:, 2], r)
             cached_base.preview = cached_base._preview_shape()
+            if not hasattr(cached_base, "has_cat"):
+                cached_base.has_cat = engraver.CAT_STL.exists()
+                if cached_base.has_cat:
+                    cached_base._load_cat(engraver.CAT_STL, cached_base.manifold.num_tri())
         engraver._base = cached_base
         _engr_mtime = mtime
         print("[server] reloaded engraver.py")
@@ -54,29 +58,40 @@ class Handler(BaseHTTPRequestHandler):
         if self.path in ("/", "/index.html"):
             self._send(200, INDEX.read_bytes(), "text/html; charset=utf-8")
         elif self.path == "/api/status":
-            ready = engraver._base is not None
-            self._send(200, json.dumps({"ready": ready, "maxChars": engraver.MAX_CHARS}).encode(),
-                       "application/json")
+            eng = _current_engraver()
+            ready = eng._base is not None
+            has_cat = bool(ready and getattr(eng._base, "has_cat", False))
+            self._send(200, json.dumps({
+                "ready": ready,
+                "hasCat": has_cat,
+                "maxChars": eng.MAX_CHARS,
+            }).encode(), "application/json")
         else:
             self._error(404, "Not found")
 
     def do_POST(self):
         if self.path not in ("/api/preview", "/api/engrave"):
             return self._error(404, "Not found")
+        eng = _current_engraver()
         try:
             length = int(self.headers.get("Content-Length", 0))
-            text = json.loads(self.rfile.read(length) or b"{}").get("text", "")
-            eng = _current_engraver()
-            name, data = eng.engrave(text, preview=self.path == "/api/preview")
+            payload = json.loads(self.rfile.read(length) or b"{}")
+            text = payload.get("text", "")
+            model = payload.get("model", "cat")
+            if model not in ("cat", "base"):
+                model = "cat"
+            name, data = eng.engrave(text, preview=self.path == "/api/preview", model=model)
         except eng.EngraveError as e:
             return self._error(400, str(e))
         except Exception as e:  # unexpected
             print("[error]", repr(e))
             return self._error(500, f"Engraving failed: {e}")
-        filename = f"Base_{name.replace(' ', '_')}.stl"
+        prefix = "Cat_Urn" if model == "cat" else "Base"
+        filename = f"{prefix}_{name.replace(' ', '_')}.stl"
         self._send(200, data, "model/stl", {
             "Content-Disposition": "attachment; filename*=UTF-8''" + urllib.parse.quote(filename),
             "X-Text": urllib.parse.quote(name),
+            "X-Model": model,
         })
 
     def log_message(self, fmt, *args):
@@ -84,7 +99,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    # load the large base in the background so the page opens immediately
+    # load the base and cat models in the background so the page opens immediately
     threading.Thread(target=engraver.get_base, daemon=True).start()
-    print(f"Base engraver running at http://localhost:{PORT}  (Ctrl+C to stop)")
+    print(f"Urn engraver running at http://localhost:{PORT}  (Ctrl+C to stop)")
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
