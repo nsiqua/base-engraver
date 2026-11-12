@@ -2,6 +2,7 @@
 
 Run:   python server.py      then open http://localhost:8000
 """
+import importlib
 import json
 import threading
 import urllib.parse
@@ -12,6 +13,28 @@ import engraver
 
 HOST, PORT = "127.0.0.1", 8000
 INDEX = Path(__file__).with_name("index.html")
+ENGR_FILE = Path(__file__).with_name("engraver.py")
+_engr_mtime = ENGR_FILE.stat().st_mtime
+
+
+def _current_engraver():
+    """Reload engraver.py if the file changed on disk, preserving the loaded Base in memory."""
+    global _engr_mtime
+    mtime = ENGR_FILE.stat().st_mtime
+    if mtime != _engr_mtime:
+        cached_base = engraver._base
+        importlib.reload(engraver)
+        if cached_base is not None:
+            cached_base.__class__ = engraver.Base
+            if not hasattr(cached_base, "prof_z"):
+                v = cached_base.manifold.to_mesh().vert_properties[:, :3].astype("float64")
+                r = (v[:, 0] ** 2 + v[:, 1] ** 2) ** 0.5
+                cached_base._outer_profile(v[:, 2], r)
+            cached_base.preview = cached_base._preview_shape()
+        engraver._base = cached_base
+        _engr_mtime = mtime
+        print("[server] reloaded engraver.py")
+    return engraver
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -43,8 +66,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", 0))
             text = json.loads(self.rfile.read(length) or b"{}").get("text", "")
-            name, data = engraver.engrave(text, preview=self.path == "/api/preview")
-        except engraver.EngraveError as e:
+            eng = _current_engraver()
+            name, data = eng.engrave(text, preview=self.path == "/api/preview")
+        except eng.EngraveError as e:
             return self._error(400, str(e))
         except Exception as e:  # unexpected
             print("[error]", repr(e))

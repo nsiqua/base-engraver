@@ -14,7 +14,7 @@
   p.sub { margin:0; color:var(--muted); font-size:13px; line-height:1.4; }
   label { font-size:13px; color:var(--muted); }
   input { width:100%; padding:12px; font-size:18px; border-radius:8px; border:1px solid #3a3f4b;
-          background:#14161a; color:var(--text); text-transform:uppercase; letter-spacing:1px; }
+          background:#14161a; color:var(--text); letter-spacing:1px; }
   .count { font-size:12px; color:var(--muted); text-align:right; margin-top:4px; }
   button { padding:12px; font-size:15px; border:0; border-radius:8px; cursor:pointer; font-weight:600; }
   #previewBtn { background:#343a46; color:var(--text); }
@@ -36,15 +36,15 @@
   </div>
   <div>
     <label for="text">Engraving text</label>
-    <input id="text" maxlength="15" placeholder="CHARLIE" autocomplete="off">
+    <input id="text" maxlength="15" placeholder="Charlie" autocomplete="off">
     <div class="count"><span id="count">0</span> / 15</div>
   </div>
   <button id="previewBtn">Preview</button>
   <button id="downloadBtn">Generate &amp; download STL</button>
   <div id="status">Loading base model…</div>
   <div class="specs">
-    Font: Arial (UPPERCASE)<br>
-    Capital height: 10 mm · Cut depth: 1 mm<br>
+    Font: Arial (mixed case &amp; accents)<br>
+    Max height: 10 mm · Cut depth: 1 mm<br>
     Position: outer wall, centred on the +Y side<br>
     Max 15 characters
   </div>

@@ -55,7 +55,7 @@ class Base:
         self.z_min = float(v[:, 2].min())
         self.z_max = float(v[:, 2].max())
         self._outer_profile(v[:, 2], r)
-        self.preview = self._preview_shape(v[:, 2], r)
+        self.preview = self._preview_shape()
         print(f"[base] loaded {self.manifold.num_tri():,} triangles in {time.time() - t:.1f}s; "
               f"R={self.r_outer:.3f} Z={self.z_min:.3f}..{self.z_max:.3f}")
 
@@ -79,26 +79,25 @@ class Base:
         smooth = np.convolve(np.pad(self.prof_r, 2, mode="edge"), k, mode="valid")
         self.prof_dr = np.gradient(smooth, self.prof_z)
 
-    def _preview_shape(self, z: np.ndarray, r: np.ndarray) -> m3d.Manifold:
-        """Light-weight revolved approximation of the base, for the browser preview only."""
-        edges = np.linspace(self.z_min, self.z_max, 121)
-        idx = np.clip(np.digitize(z, edges) - 1, 0, len(edges) - 2)
-        rmax = np.full(len(edges) - 1, np.nan)
-        rmin = np.full(len(edges) - 1, np.nan)
-        np.fmax.at(rmax, idx, r)
-        np.fmin.at(rmin, idx, r)
-        zc = (edges[:-1] + edges[1:]) / 2
-        zc[0], zc[-1] = self.z_min, self.z_max
-        ok = ~np.isnan(rmax)
-        inner = np.column_stack([rmin[ok], zc[ok]])
-        outer = np.column_stack([rmax[ok], zc[ok]])[::-1]
+    def _preview_shape(self) -> m3d.Manifold:
+        """Light-weight revolved approximation of the base, for the browser preview only.
+
+        Uses the exact measured outer wall profile prof_r(prof_z) (downsampled to every
+        0.05 mm) so the preview outer wall matches the cutter surface with no residual film.
+        """
+        zc = self.prof_z[::5].copy()
+        zc[-1] = self.z_max
+        rmax = self.prof_r[::5].copy()
+        rmin = np.full_like(zc, 29.85)
+        inner = np.column_stack([rmin, zc])
+        outer = np.column_stack([rmax, zc])[::-1]
         profile = m3d.CrossSection([np.vstack([inner, outer])], m3d.FillRule.NonZero)
         return m3d.Manifold.revolve(profile, 360)
 
 
 # ---------------------------------------------------------------- text cutter
 def normalise_text(text: str) -> str:
-    text = " ".join((text or "").split()).upper()
+    text = " ".join((text or "").split())
     if not text:
         raise EngraveError("Please enter some text.")
     if len(text) > MAX_CHARS:
@@ -110,14 +109,25 @@ def normalise_text(text: str) -> str:
 
 
 def _text_polygons(text: str) -> list[np.ndarray]:
-    """Flat text outline (mm). Baseline at y=0, capital height = CAP_HEIGHT, centred on x=0."""
+    """Flat text outline (mm).
+
+    Standard scale sets capital 'H' height = CAP_HEIGHT (10 mm). If the text's
+    total vertical span (including descenders like 'y' or accents like 'Õ') exceeds
+    CAP_HEIGHT, it is uniformly scaled down so the total height is CAP_HEIGHT.
+    Centred on x=0.
+    """
     big = 1000.0  # render large so curves are finely flattened, then scale down
     cap = TextPath((0, 0), "H", size=big, prop=_FONT_PROPS).get_extents().height
     scale = CAP_HEIGHT / cap
     path = TextPath((0, 0), text, size=big, prop=_FONT_PROPS)
-    polys = [p[:-1] * scale for p in path.to_polygons(closed_only=True) if len(p) > 3]
-    if not polys:
+    raw = [p[:-1] for p in path.to_polygons(closed_only=True) if len(p) > 3]
+    if not raw:
         raise EngraveError("Text contains no printable characters.")
+    all_raw = np.vstack(raw)
+    span_y = (all_raw[:, 1].max() - all_raw[:, 1].min()) * scale
+    if span_y > CAP_HEIGHT:
+        scale *= CAP_HEIGHT / span_y
+    polys = [p * scale for p in raw]
     allp = np.vstack(polys)
     cx = (allp[:, 0].min() + allp[:, 0].max()) / 2
     return [p - [cx, 0.0] for p in polys]
@@ -127,19 +137,13 @@ def build_cutter(text: str, base: Base) -> m3d.Manifold:
     polys = _text_polygons(text)
     allp = np.vstack(polys)
 
-    # vertical placement: capitals centred on the full height of the base
+    # vertical placement: center the text's vertical bounding box on the base height
     z_mid = (base.z_min + base.z_max) / 2
-    y_shift = z_mid - CAP_HEIGHT / 2
+    y_mid = (allp[:, 1].min() + allp[:, 1].max()) / 2
+    y_shift = z_mid - y_mid
     lo, hi = allp[:, 1].min() + y_shift, allp[:, 1].max() + y_shift
     if lo < base.z_min + EDGE_MARGIN or hi > base.z_max - EDGE_MARGIN:
-        y_lo, y_hi = base.z_min + EDGE_MARGIN - y_shift, base.z_max - EDGE_MARGIN - y_shift
-        culprits = []
-        for c in dict.fromkeys(text.replace(" ", "")):
-            p = np.vstack(_text_polygons(c))
-            if p[:, 1].min() < y_lo or p[:, 1].max() > y_hi:
-                culprits.append(c)
-        raise EngraveError("These characters don't fit on the side of the base at 10 mm "
-                           f"letter height: {' '.join(culprits)}")
+        raise EngraveError("Text is too tall to fit on the side of the base.")
 
     width = allp[:, 0].max() - allp[:, 0].min()
     if width / base.r_outer > np.pi * 1.5:

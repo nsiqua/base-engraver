@@ -21,21 +21,18 @@ python server.py
 ```
 Open http://localhost:8000. The base model takes about 15 s to load when the server starts.
 
-Command-line alternative: `python engraver.py "Charlie"` writes `Base_CHARLIE.stl` next to the script.
+Command-line alternative: `python engraver.py "Charlie"` writes `Base_Charlie.stl` next to the script.
 
 The preview loads three.js from a CDN, so the browser needs internet access.
 
 ## Settings (top of `engraver.py`)
 | Setting | Value |
 |---|---|
-| Font | `C:\Windows\Fonts\arial.ttf`, text forced to UPPERCASE |
-| `CAP_HEIGHT` | 10 mm (capitals centred on the full 11.8 mm height) |
+| Font | `C:\Windows\Fonts\arial.ttf` (supports uppercase, lowercase, accents/Estonian letters, punctuation) |
+| `CAP_HEIGHT` | 10 mm max height (standard capital height is 10 mm; if text has descenders like `y` or tall accents like `Õ`, it scales down uniformly so total height stays within 10 mm) |
 | `DEPTH` | 1 mm, measured along the surface normal, so the cut is a uniform 1 mm deep on the flat wall and on the rounded top edge |
 | `MAX_CHARS` | 15 |
 | `FRONT_ANGLE` | 0 = centred on the +Y side |
-
-Characters that would run past the top or bottom edge at 10 mm (accented capitals,
-`( ) , ; [ ] { } $ @ _ |`) are rejected with a clear message.
 
 ## How it works
 1. Text → Arial outline (matplotlib `TextPath`) → 2D cross-section
