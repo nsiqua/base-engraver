@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 3D models: the blank base is large (184 MB, over GitHub's 100 MB limit) and
+# private; generated engravings are build outputs. Keep all STLs out of git.
+*.stl
+*.STL
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

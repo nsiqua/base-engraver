@@ -1,0 +1,195 @@
+"""Core engraving logic: wraps text around the outer wall of the urn base and cuts it in.
+
+All units are millimetres. The base is assumed to be a ring centred on the Z axis
+(verified for "Base with Screw2.stl": centre (0, 0), outer radius 49.68, Z -5.80..6.00).
+"""
+from __future__ import annotations
+
+import io
+import struct
+import threading
+import time
+from pathlib import Path
+
+import numpy as np
+import trimesh
+import manifold3d as m3d
+from fontTools.ttLib import TTFont
+from matplotlib.font_manager import FontProperties
+from matplotlib.textpath import TextPath
+
+# ---------------------------------------------------------------- settings
+BASE_STL = Path(__file__).with_name("Base with Screw2.stl")
+FONT_FILE = Path(r"C:\Windows\Fonts\arial.ttf")
+CAP_HEIGHT = 10.0      # mm, height of capital letters (user choice "B")
+DEPTH = 1.0            # mm, cut depth measured from the cylindrical outer wall
+MAX_CHARS = 15
+OVERSHOOT = 1.0        # mm the cutter sticks out beyond the wall (clean cut)
+EDGE_MARGIN = 0.05     # mm, letters must stay at least this far from top/bottom faces
+REFINE_LEN = 0.4       # mm, max edge length before wrapping (smooth curvature)
+FRONT_ANGLE = 0.0      # radians; 0 = text centred on the +Y side
+
+_FONT_PROPS = FontProperties(fname=str(FONT_FILE))
+_CMAP = TTFont(str(FONT_FILE))["cmap"].getBestCmap()
+_LOCK = threading.Lock()
+
+
+class EngraveError(ValueError):
+    """Raised for user-input problems (shown to the user)."""
+
+
+# ---------------------------------------------------------------- base model
+class Base:
+    def __init__(self, path: Path):
+        t = time.time()
+        tm = trimesh.load(str(path), process=True)
+        verts = np.asarray(tm.vertices, dtype=np.float32)
+        faces = np.asarray(tm.faces, dtype=np.uint32)
+        self.manifold = m3d.Manifold(m3d.Mesh(vert_properties=verts, tri_verts=faces))
+        if self.manifold.status() != m3d.Error.NoError:
+            raise RuntimeError(f"Base mesh is not manifold: {self.manifold.status()}")
+
+        v = verts.astype(np.float64)
+        r = np.hypot(v[:, 0], v[:, 1])
+        self.r_outer = float(r.max())
+        self.z_min = float(v[:, 2].min())
+        self.z_max = float(v[:, 2].max())
+        self.preview = self._preview_shape(v[:, 2], r)
+        print(f"[base] loaded {self.manifold.num_tri():,} triangles in {time.time() - t:.1f}s; "
+              f"R={self.r_outer:.3f} Z={self.z_min:.3f}..{self.z_max:.3f}")
+
+    def _preview_shape(self, z: np.ndarray, r: np.ndarray) -> m3d.Manifold:
+        """Light-weight revolved approximation of the base, for the browser preview only."""
+        edges = np.linspace(self.z_min, self.z_max, 121)
+        idx = np.clip(np.digitize(z, edges) - 1, 0, len(edges) - 2)
+        rmax = np.full(len(edges) - 1, np.nan)
+        rmin = np.full(len(edges) - 1, np.nan)
+        np.fmax.at(rmax, idx, r)
+        np.fmin.at(rmin, idx, r)
+        zc = (edges[:-1] + edges[1:]) / 2
+        zc[0], zc[-1] = self.z_min, self.z_max
+        ok = ~np.isnan(rmax)
+        inner = np.column_stack([rmin[ok], zc[ok]])
+        outer = np.column_stack([rmax[ok], zc[ok]])[::-1]
+        profile = m3d.CrossSection([np.vstack([inner, outer])], m3d.FillRule.NonZero)
+        return m3d.Manifold.revolve(profile, 360)
+
+
+# ---------------------------------------------------------------- text cutter
+def normalise_text(text: str) -> str:
+    text = " ".join((text or "").split()).upper()
+    if not text:
+        raise EngraveError("Please enter some text.")
+    if len(text) > MAX_CHARS:
+        raise EngraveError(f"Text is too long ({len(text)} characters, max {MAX_CHARS}).")
+    missing = sorted({c for c in text if c != " " and ord(c) not in _CMAP})
+    if missing:
+        raise EngraveError(f"Arial has no glyph for: {' '.join(missing)}")
+    return text
+
+
+def _text_polygons(text: str) -> list[np.ndarray]:
+    """Flat text outline (mm). Baseline at y=0, capital height = CAP_HEIGHT, centred on x=0."""
+    big = 1000.0  # render large so curves are finely flattened, then scale down
+    cap = TextPath((0, 0), "H", size=big, prop=_FONT_PROPS).get_extents().height
+    scale = CAP_HEIGHT / cap
+    path = TextPath((0, 0), text, size=big, prop=_FONT_PROPS)
+    polys = [p[:-1] * scale for p in path.to_polygons(closed_only=True) if len(p) > 3]
+    if not polys:
+        raise EngraveError("Text contains no printable characters.")
+    allp = np.vstack(polys)
+    cx = (allp[:, 0].min() + allp[:, 0].max()) / 2
+    return [p - [cx, 0.0] for p in polys]
+
+
+def build_cutter(text: str, base: Base) -> m3d.Manifold:
+    polys = _text_polygons(text)
+    allp = np.vstack(polys)
+
+    # vertical placement: capitals centred on the full height of the base
+    z_mid = (base.z_min + base.z_max) / 2
+    y_shift = z_mid - CAP_HEIGHT / 2
+    lo, hi = allp[:, 1].min() + y_shift, allp[:, 1].max() + y_shift
+    if lo < base.z_min + EDGE_MARGIN or hi > base.z_max - EDGE_MARGIN:
+        y_lo, y_hi = base.z_min + EDGE_MARGIN - y_shift, base.z_max - EDGE_MARGIN - y_shift
+        culprits = []
+        for c in dict.fromkeys(text.replace(" ", "")):
+            p = np.vstack(_text_polygons(c))
+            if p[:, 1].min() < y_lo or p[:, 1].max() > y_hi:
+                culprits.append(c)
+        raise EngraveError("These characters don't fit on the side of the base at 10 mm "
+                           f"letter height: {' '.join(culprits)}")
+
+    width = allp[:, 0].max() - allp[:, 0].min()
+    if width / base.r_outer > np.pi * 1.5:
+        raise EngraveError("Text is too wide to fit around the base.")
+
+    section = m3d.CrossSection(polys, m3d.FillRule.NonZero)
+    solid = section.extrude(DEPTH + OVERSHOOT).refine_to_length(REFINE_LEN)
+
+    r_in = base.r_outer - DEPTH
+    R = base.r_outer
+
+    def wrap(v: np.ndarray) -> np.ndarray:
+        x, y, t = v[:, 0], v[:, 1], v[:, 2]
+        theta = FRONT_ANGLE + x / R          # arc length measured on the outer wall
+        rad = r_in + t
+        out = np.empty_like(v)
+        out[:, 0] = -rad * np.sin(theta)     # reads left-to-right when viewed from +Y
+        out[:, 1] = rad * np.cos(theta)
+        out[:, 2] = y + y_shift
+        return out
+
+    return solid.warp_batch(wrap)
+
+
+# ---------------------------------------------------------------- STL export
+def to_stl_bytes(man: m3d.Manifold, name: str = "engraved") -> bytes:
+    mesh = man.to_mesh()
+    v = np.asarray(mesh.vert_properties, dtype=np.float32)[:, :3]
+    f = np.asarray(mesh.tri_verts, dtype=np.int64)
+    tri = v[f]
+    n = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    ln = np.linalg.norm(n, axis=1, keepdims=True)
+    n = np.divide(n, ln, out=np.zeros_like(n), where=ln > 0)
+    rec = np.zeros(len(f), dtype=np.dtype([("n", "<f4", 3), ("v", "<f4", (3, 3)), ("a", "<u2")]))
+    rec["n"], rec["v"] = n, tri
+    buf = io.BytesIO()
+    buf.write(f"Engraved base: {name}".encode("ascii", "replace")[:80].ljust(80, b" "))
+    buf.write(struct.pack("<I", len(f)))
+    buf.write(rec.tobytes())
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------- public API
+_base: Base | None = None
+
+
+def get_base() -> Base:
+    global _base
+    with _LOCK:
+        if _base is None:
+            _base = Base(BASE_STL)
+        return _base
+
+
+def engrave(text: str, preview: bool = False) -> tuple[str, bytes]:
+    text = normalise_text(text)
+    base = get_base()
+    t = time.time()
+    cutter = build_cutter(text, base)
+    target = base.preview if preview else base.manifold
+    with _LOCK:
+        result = target - cutter
+        data = to_stl_bytes(result, text)
+    print(f"[engrave] {'preview' if preview else 'full'} '{text}': "
+          f"{result.num_tri():,} tris, {len(data) / 1e6:.1f} MB, {time.time() - t:.1f}s")
+    return text, data
+
+
+if __name__ == "__main__":  # quick CLI test:  python engraver.py "Charlie"
+    import sys
+    name, stl = engrave(sys.argv[1] if len(sys.argv) > 1 else "Charlie")
+    out = Path(__file__).with_name(f"Base_{name.replace(' ', '_')}.stl")
+    out.write_bytes(stl)
+    print("wrote", out)
