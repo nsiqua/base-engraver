@@ -8,15 +8,25 @@
   :root { --bg:#16181d; --panel:#20232a; --text:#e8e8ea; --muted:#9aa0aa; --accent:#4f8cff; --err:#ff6b6b; }
   * { box-sizing: border-box; }
   body { margin:0; font-family: system-ui, Segoe UI, Arial, sans-serif; background:var(--bg); color:var(--text);
-         display:grid; grid-template-columns: 340px 1fr; height:100vh; }
-  aside { background:var(--panel); padding:24px; display:flex; flex-direction:column; gap:14px; }
+         display:grid; grid-template-columns: 360px 1fr; height:100vh; }
+  aside { background:var(--panel); padding:22px 24px; display:flex; flex-direction:column; gap:14px; overflow-y:auto; }
   h1 { font-size:20px; margin:0 0 4px; }
   p.sub { margin:0; color:var(--muted); font-size:13px; line-height:1.4; }
   label { font-size:13px; color:var(--muted); display:block; margin-bottom:5px; }
-  input, select { width:100%; padding:11px 12px; font-size:16px; border-radius:8px; border:1px solid #3a3f4b;
-                  background:#14161a; color:var(--text); }
-  input { font-size:18px; letter-spacing:1px; }
+  input[type="text"], select { width:100%; padding:10px 12px; font-size:16px; border-radius:8px; border:1px solid #3a3f4b;
+                               background:#14161a; color:var(--text); }
+  input[type="text"] { font-size:18px; letter-spacing:1px; }
   .count { font-size:12px; color:var(--muted); text-align:right; margin-top:4px; }
+  .slider-box { background:#181b21; border:1px solid #2e333e; border-radius:10px; padding:12px 14px; display:flex; flex-direction:column; gap:8px; }
+  .slider-head { display:flex; justify-content:space-between; align-items:baseline; }
+  .slider-title { font-size:13px; color:var(--muted); }
+  .slider-val { font-size:15px; font-weight:600; color:var(--text); }
+  input[type="range"] { width:100%; accent-color:var(--accent); cursor:pointer; margin:2px 0; }
+  .cap-grid { display:grid; grid-template-columns: 1fr 1fr; gap:8px; margin-top:2px; }
+  .cap-card { background:#121419; border:1px solid #282c36; border-radius:7px; padding:7px 10px; }
+  .cap-label { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:0.4px; }
+  .cap-num { font-size:14px; font-weight:600; color:var(--accent); margin-top:2px; }
+  .cap-dims { font-size:11.5px; color:var(--muted); margin-top:2px; }
   button { padding:12px; font-size:15px; border:0; border-radius:8px; cursor:pointer; font-weight:600; }
   #previewBtn { background:#343a46; color:var(--text); }
   #downloadBtn { background:var(--accent); color:white; }
@@ -33,7 +43,7 @@
 <aside>
   <div>
     <h1>Pet Urn Engraver</h1>
-    <p class="sub">Select a model, enter a name, preview it in 3D, and download the full-quality engraved STL.</p>
+    <p class="sub">Select a model, set your cat's weight, enter a name, preview in 3D, and download the custom STL.</p>
   </div>
   <div>
     <label for="modelSelect">Model</label>
@@ -42,9 +52,27 @@
       <option value="base">Blank Base Only (with Screw)</option>
     </select>
   </div>
+  <div class="slider-box">
+    <div class="slider-head">
+      <span class="slider-title">Cat's Live Weight</span>
+      <span class="slider-val" id="weightReadout">4.5 kg / 9.9 lbs</span>
+    </div>
+    <input type="range" id="weightSlider" min="1.5" max="12.0" step="0.1" value="4.5">
+    <div class="cap-grid">
+      <div class="cap-card">
+        <div class="cap-label">Urn Capacity</div>
+        <div class="cap-num" id="capReadout">198 mL · 6.7 fl oz</div>
+      </div>
+      <div class="cap-card">
+        <div class="cap-label">Urn Scale &amp; Size</div>
+        <div class="cap-num" id="scaleReadout">75.1% scale</div>
+      </div>
+    </div>
+    <div class="cap-dims" id="dimsReadout">Dimensions: Ø 74.6 mm × 109.0 mm tall</div>
+  </div>
   <div>
     <label for="text">Engraving text</label>
-    <input id="text" maxlength="15" placeholder="Charlie" autocomplete="off">
+    <input type="text" id="text" maxlength="15" placeholder="Charlie" autocomplete="off">
     <div class="count"><span id="count">0</span> / 15</div>
   </div>
   <button id="previewBtn">Preview</button>
@@ -52,14 +80,14 @@
   <div id="status">Loading models…</div>
   <div class="specs">
     Font: Arial (mixed case &amp; accents)<br>
-    Max height: 10 mm · Cut depth: 1 mm<br>
+    Text height: up to 10 mm · Cut depth: 1 mm<br>
     Alignment: symmetrical under cat's face<br>
-    Max 15 characters
+    Default weight: 4.5 kg (~10 lbs, adult Domestic Shorthair)
   </div>
 </aside>
 <main>
   <canvas id="view"></canvas>
-  <div class="note">Preview uses a lightweight mesh for speed. The download exports the original full-resolution STL.</div>
+  <div class="note">3D grid = 10 mm squares (220 × 220 mm build plate). Preview scales live with the slider.</div>
 </main>
 
 <script type="importmap">
@@ -74,8 +102,44 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { STLLoader } from "three/addons/loaders/STLLoader.js";
 
 const $ = (id) => document.getElementById(id);
-const input = $("text"), modelSelect = $("modelSelect"), status = $("status");
+const input = $("text"), modelSelect = $("modelSelect"), weightSlider = $("weightSlider"), status = $("status");
 const previewBtn = $("previewBtn"), downloadBtn = $("downloadBtn");
+
+const ORIG_CAPACITY_ML = 467.2;
+const ML_PER_KG = 44.0;
+const ML_PER_FL_OZ = 29.5735;
+const ORIG_DIAM_MM = 99.36;
+const ORIG_CAT_H_MM = 145.11;
+const ORIG_BASE_H_MM = 11.80;
+
+let previewLoadedScale = null;
+let previewLoadedModel = null;
+
+function computeSizing() {
+  const wKg = parseFloat(weightSlider.value);
+  const wLbs = wKg * 2.20462;
+  const capMl = wKg * ML_PER_KG;
+  const capOz = capMl / ML_PER_FL_OZ;
+  const scale = Math.cbrt(capMl / ORIG_CAPACITY_ML);
+  return { wKg, wLbs, capMl, capOz, scale };
+}
+
+function updateSliderReadout() {
+  const { wKg, wLbs, capMl, capOz, scale } = computeSizing();
+  const model = modelSelect.value;
+  $("weightReadout").textContent = `${wKg.toFixed(1)} kg / ${wLbs.toFixed(1)} lbs`;
+  $("capReadout").textContent = `${Math.round(capMl)} mL · ${capOz.toFixed(1)} fl oz`;
+  $("scaleReadout").textContent = `${(scale * 100).toFixed(1)}% scale`;
+  const diam = (ORIG_DIAM_MM * scale).toFixed(1);
+  const h = ((model === "cat" ? ORIG_CAT_H_MM : ORIG_BASE_H_MM) * scale).toFixed(1);
+  $("dimsReadout").textContent = `Dimensions: Ø ${diam} mm × ${h} mm tall`;
+
+  // Dynamically scale the currently displayed 3D preview mesh in real time against the fixed build plate grid
+  if (mesh && previewLoadedScale && previewLoadedModel === model) {
+    const rel = scale / previewLoadedScale;
+    mesh.scale.set(rel, rel, rel);
+  }
+}
 
 // ---------- 3D view (Z up, like a slicer)
 const canvas = $("view");
@@ -97,18 +161,20 @@ const material = new THREE.MeshStandardMaterial({ color: 0xeeeeee, roughness: 0.
 let mesh = null;
 
 function setCameraForModel(model) {
+  const { scale } = computeSizing();
   if (model === "cat") {
     grid.position.z = 0.0;
-    controls.target.set(0, 0, 58);
+    controls.target.set(0, 0, 50 * scale);
     camera.position.set(0, 290, 105);
   } else {
-    grid.position.z = -5.8;
+    grid.position.z = -5.8 * scale;
     controls.target.set(0, 0, 0);
     camera.position.set(0, 190, 110);
   }
   controls.update();
 }
 setCameraForModel(modelSelect.value);
+updateSliderReadout();
 
 function resize() {
   const w = canvas.parentElement.clientWidth, h = canvas.parentElement.clientHeight;
@@ -117,21 +183,30 @@ function resize() {
 window.addEventListener("resize", resize); resize();
 (function loop() { controls.update(); renderer.render(scene, camera); requestAnimationFrame(loop); })();
 
-function showStl(buffer, model) {
+function showStl(buffer, model, loadedScale) {
   const geom = new STLLoader().parse(buffer);
   geom.computeVertexNormals();
   if (mesh) { scene.remove(mesh); mesh.geometry.dispose(); }
   mesh = new THREE.Mesh(geom, material);
+  mesh.scale.set(1, 1, 1);
+  previewLoadedScale = loadedScale;
+  previewLoadedModel = model;
   scene.add(mesh);
   setCameraForModel(model);
 }
 
 // ---------- UI
 function setStatus(msg, err = false) { status.textContent = msg; status.className = err ? "err" : ""; }
-function busy(b) { previewBtn.disabled = downloadBtn.disabled = b; input.disabled = modelSelect.disabled = b; }
+function busy(b) {
+  previewBtn.disabled = downloadBtn.disabled = b;
+  input.disabled = modelSelect.disabled = weightSlider.disabled = b;
+}
 input.addEventListener("input", () => { $("count").textContent = input.value.length; });
 input.addEventListener("keydown", (e) => { if (e.key === "Enter") preview(); });
+weightSlider.addEventListener("input", updateSliderReadout);
+weightSlider.addEventListener("change", () => { if (input.value.trim()) preview(); });
 modelSelect.addEventListener("change", () => {
+  updateSliderReadout();
   setCameraForModel(modelSelect.value);
   if (input.value.trim()) preview();
 });
@@ -139,9 +214,13 @@ modelSelect.addEventListener("change", () => {
 async function call(endpoint) {
   const text = input.value.trim();
   const model = modelSelect.value;
+  const weightKg = parseFloat(weightSlider.value);
   if (!text) { setStatus("Please enter some text.", true); return null; }
-  const res = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json" },
-                                      body: JSON.stringify({ text, model }) });
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, model, weightKg }),
+  });
   if (!res.ok) {
     let msg = res.statusText;
     try { msg = (await res.json()).error; } catch {}
@@ -152,25 +231,30 @@ async function call(endpoint) {
 
 async function preview() {
   const model = modelSelect.value;
-  busy(true); setStatus("Building preview…");
+  const { scale, wKg, capMl } = computeSizing();
+  busy(true); setStatus(`Building preview (${wKg.toFixed(1)} kg · ${Math.round(capMl)} mL)…`);
   try {
     const res = await call("/api/preview");
-    if (res) { showStl(await res.arrayBuffer(), model); setStatus("Preview ready. Drag to rotate, scroll to zoom."); }
+    if (res) {
+      showStl(await res.arrayBuffer(), model, scale);
+      setStatus("Preview ready. Drag to rotate, scroll to zoom.");
+    }
   } catch (e) { setStatus(e.message, true); }
   busy(false);
 }
 
 async function download() {
   const model = modelSelect.value;
+  const { wKg, capMl } = computeSizing();
   const sizeHint = model === "cat" ? "~376 MB" : "~183 MB";
-  busy(true); setStatus(`Engraving the full-quality model (${sizeHint})…`);
+  busy(true); setStatus(`Engraving & scaling full-quality model (${wKg.toFixed(1)} kg · ${Math.round(capMl)} mL, ${sizeHint})…`);
   const t0 = performance.now();
   try {
     const res = await call("/api/engrave");
     if (res) {
       const name = decodeURIComponent(res.headers.get("X-Text") || "engraved").replace(/ /g, "_");
       const prefix = model === "cat" ? "Cat_Urn" : "Base";
-      const fileName = `${prefix}_${name}.stl`;
+      const fileName = `${prefix}_${name}_${wKg.toFixed(1)}kg.stl`;
       const blob = await res.blob();
       const a = document.createElement("a");
       a.href = URL.createObjectURL(blob); a.download = fileName;
@@ -189,7 +273,7 @@ busy(true);
 (async function poll() {
   try {
     const s = await (await fetch("/api/status")).json();
-    if (s.ready) { busy(false); setStatus("Ready. Enter a name and click Preview."); input.focus(); return; }
+    if (s.ready) { busy(false); setStatus("Ready. Adjust weight, enter a name, and click Preview."); input.focus(); return; }
   } catch {}
   setTimeout(poll, 1000);
 })();

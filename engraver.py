@@ -4,6 +4,10 @@ Supports both:
 - "cat":  Domestic ShortHair_Complete_Blank.stl (full cat urn + base, text symmetrical to the cat's face)
 - "base": Base with Screw2.stl (standalone threaded base ring)
 
+Supports dynamic 3D scaling based on the cat's live weight (kg), keeping the engraved
+text at a true 10 mm height (or capped to fit when the scaled base wall is < 10.6 mm tall)
+and a true 1 mm depth along the surface normal of the scaled urn.
+
 All units are millimetres.
 """
 from __future__ import annotations
@@ -25,13 +29,21 @@ from matplotlib.textpath import TextPath
 BASE_STL = Path(__file__).with_name("Base with Screw2.stl")
 CAT_STL = Path(__file__).with_name("Domestic ShortHair_Complete_Blank.stl")
 FONT_FILE = Path(r"C:\Windows\Fonts\arial.ttf")
-CAP_HEIGHT = 10.0      # mm, max height of letters (standard capital 'H' height = 10 mm)
-DEPTH = 1.0            # mm, cut depth measured along the surface normal (uniform, incl. rounded top edge)
+CAP_HEIGHT = 10.0          # mm, max height of letters (standard capital 'H' height = 10 mm)
+DEPTH = 1.0                # mm, cut depth measured along the surface normal (uniform, incl. rounded top edge)
 MAX_CHARS = 15
-OVERSHOOT = 1.0        # mm the cutter sticks out beyond the wall (clean cut)
-EDGE_MARGIN = 0.05     # mm, letters must stay at least this far from top/bottom faces
-REFINE_LEN = 0.4       # mm, max edge length before wrapping (smooth curvature)
-FRONT_ANGLE = 0.0      # radians; 0 = text centred on the +Y side of Base with Screw2.stl
+OVERSHOOT = 1.0            # mm the cutter sticks out beyond the wall (clean cut)
+EDGE_MARGIN = 0.3          # mm, minimum margin from top/bottom faces of the scaled base
+REFINE_LEN = 0.4           # mm, max edge length before wrapping (smooth curvature)
+FRONT_ANGLE = 0.0          # radians; 0 = text centred on the +Y side of Base with Screw2.stl
+
+# Weight -> Capacity -> Scale parameters
+ORIG_CAPACITY_ML = 467.2   # measured usable chamber volume of the unscaled Cat Urn (Z >= 11.8 mm)
+ML_PER_KG = 44.0           # 1 in^3/lb (36.12 mL/kg) + ~20% buffer for ash bag / comfortable fit
+ML_PER_FL_OZ = 29.5735     # US fluid ounce
+MIN_WEIGHT_KG = 1.5        # ~3.3 lbs
+MAX_WEIGHT_KG = 12.0       # ~26.5 lbs
+DEFAULT_WEIGHT_KG = 4.5    # ~10 lbs (typical adult Domestic Shorthair cat)
 
 _STL_DTYPE = np.dtype([("n", "<f4", 3), ("v", "<f4", (3, 3)), ("a", "<u2")])
 _FONT_PROPS = FontProperties(fname=str(FONT_FILE))
@@ -41,6 +53,29 @@ _LOCK = threading.Lock()
 
 class EngraveError(ValueError):
     """Raised for user-input problems (shown to the user)."""
+
+
+def sizing_for_weight(weight_kg: float | None) -> dict:
+    """Compute required capacity (mL, fl oz) and linear scale factor s for a given cat weight (kg)."""
+    if weight_kg is None:
+        w = DEFAULT_WEIGHT_KG
+    else:
+        try:
+            w = float(weight_kg)
+        except (TypeError, ValueError):
+            raise EngraveError("Invalid cat weight.")
+    if w < MIN_WEIGHT_KG or w > MAX_WEIGHT_KG:
+        raise EngraveError(f"Cat weight must be between {MIN_WEIGHT_KG} kg and {MAX_WEIGHT_KG} kg.")
+    cap_ml = w * ML_PER_KG
+    cap_oz = cap_ml / ML_PER_FL_OZ
+    scale = float((cap_ml / ORIG_CAPACITY_ML) ** (1.0 / 3.0))
+    return {
+        "weightKg": round(w, 2),
+        "weightLbs": round(w * 2.20462, 1),
+        "capacityMl": round(cap_ml, 1),
+        "capacityOz": round(cap_oz, 1),
+        "scale": scale,
+    }
 
 
 # ---------------------------------------------------------------- base & cat models
@@ -59,6 +94,7 @@ class Base:
         self.r_outer = float(r.max())
         self.z_min = float(v[:, 2].min())
         self.z_max = float(v[:, 2].max())
+        self.orig_height = self.z_max - self.z_min
         self._outer_profile(v[:, 2], r)
         self.preview = self._preview_shape()
         print(f"[base] loaded {self.manifold.num_tri():,} triangles in {time.time() - t:.1f}s; "
@@ -130,6 +166,7 @@ class Base:
         v0[:, 0] -= 128.0
         v0[:, 1] -= 128.0
         z = v0[:, 2]
+        self.cat_orig_height = float(z.max())
         top = v0[z > z.max() - 12.0]
         c = np.array([top[top[:, 0].argmin(), :2], top[top[:, 0].argmax(), :2]])
         for _ in range(30):
@@ -155,7 +192,7 @@ class Base:
         # which maps to Cat XY (r cos(theta), r sin(theta)), i.e. Cat azimuth = `theta`!
         self.cat_front_angle = float(self.cat_text_azimuth_rad)
 
-        # Build a seamless vertex-clustered preview mesh of the cat body + disc
+        # Build a seamless vertex-clustered preview mesh of the cat body + disc (centered at XY=(0,0), Z>=0)
         self.cat_preview_records = self._decimate_cat_for_preview(
             np.concatenate([self.cat_body_records, self.cat_disc_records]), grid=0.85
         )
@@ -206,25 +243,25 @@ def normalise_text(text: str) -> str:
     return text
 
 
-def _text_polygons(text: str) -> list[np.ndarray]:
+def _text_polygons(text: str, target_cap_height: float = CAP_HEIGHT) -> list[np.ndarray]:
     """Flat text outline (mm).
 
-    Standard scale sets capital 'H' height = CAP_HEIGHT (10 mm). If the text's
+    Standard scale sets capital 'H' height = target_cap_height (up to 10 mm). If the text's
     total vertical span (including descenders like 'y' or accents like 'Õ') exceeds
-    CAP_HEIGHT, it is uniformly scaled down so the total height is CAP_HEIGHT.
+    target_cap_height, it is uniformly scaled down so the total height is target_cap_height.
     Centred on x=0.
     """
     big = 1000.0  # render large so curves are finely flattened, then scale down
     cap = TextPath((0, 0), "H", size=big, prop=_FONT_PROPS).get_extents().height
-    scale = CAP_HEIGHT / cap
+    scale = target_cap_height / cap
     path = TextPath((0, 0), text, size=big, prop=_FONT_PROPS)
     raw = [p[:-1] for p in path.to_polygons(closed_only=True) if len(p) > 3]
     if not raw:
         raise EngraveError("Text contains no printable characters.")
     all_raw = np.vstack(raw)
     span_y = (all_raw[:, 1].max() - all_raw[:, 1].min()) * scale
-    if span_y > CAP_HEIGHT:
-        scale *= CAP_HEIGHT / span_y
+    if span_y > target_cap_height:
+        scale *= target_cap_height / span_y
     polys = [p * scale for p in raw]
     allp = np.vstack(polys)
     cx = (allp[:, 0].min() + allp[:, 0].max()) / 2
@@ -232,8 +269,24 @@ def _text_polygons(text: str) -> list[np.ndarray]:
 
 
 def build_cutter(text: str, base: Base, front_angle: float = FRONT_ANGLE,
-                 arc_dir: float = 1.0) -> m3d.Manifold:
-    polys = _text_polygons(text)
+                 scale_factor: float = 1.0) -> m3d.Manifold:
+    """Build the 3D text cutter in the unscaled Base coordinate frame such that, after
+    the base is scaled by `scale_factor`, the engraved letters have a physical height
+    of up to 10 mm (capped to fit the scaled base wall) and a physical depth of 1 mm.
+    """
+    scaled_wall_height = base.orig_height * scale_factor
+    max_physical_height = min(CAP_HEIGHT, scaled_wall_height - 2.0 * EDGE_MARGIN)
+    if max_physical_height <= 1.0:
+        raise EngraveError("Scaled base is too small for engraving.")
+
+    # Convert physical text dimensions into the unscaled Base coordinate space
+    eff_cap_height = max_physical_height / scale_factor
+    eff_depth = DEPTH / scale_factor
+    eff_overshoot = OVERSHOOT / scale_factor
+    eff_refine = REFINE_LEN / scale_factor
+    eff_margin = EDGE_MARGIN / scale_factor
+
+    polys = _text_polygons(text, target_cap_height=eff_cap_height)
     allp = np.vstack(polys)
 
     # vertical placement: center the text's vertical bounding box on the base height
@@ -241,7 +294,7 @@ def build_cutter(text: str, base: Base, front_angle: float = FRONT_ANGLE,
     y_mid = (allp[:, 1].min() + allp[:, 1].max()) / 2
     y_shift = z_mid - y_mid
     lo, hi = allp[:, 1].min() + y_shift, allp[:, 1].max() + y_shift
-    if lo < base.z_min + EDGE_MARGIN or hi > base.z_max - EDGE_MARGIN:
+    if lo < base.z_min + eff_margin - 1e-4 or hi > base.z_max - eff_margin + 1e-4:
         raise EngraveError("Text is too tall to fit on the side of the base.")
 
     width = allp[:, 0].max() - allp[:, 0].min()
@@ -249,25 +302,22 @@ def build_cutter(text: str, base: Base, front_angle: float = FRONT_ANGLE,
         raise EngraveError("Text is too wide to fit around the base.")
 
     section = m3d.CrossSection(polys, m3d.FillRule.NonZero)
-    if arc_dir < 0:
-        # Mirror x before extruding so triangle winding stays outward-facing when theta decreases with x
-        section = section.scale([-1.0, 1.0])
-    solid = section.extrude(DEPTH + OVERSHOOT).refine_to_length(REFINE_LEN)
+    solid = section.extrude(eff_depth + eff_overshoot).refine_to_length(eff_refine)
 
     R = base.r_outer
 
     def wrap(v: np.ndarray) -> np.ndarray:
-        # x: along the text, y: up, t: 0..DEPTH+OVERSHOOT through the wall (t=DEPTH is the surface)
+        # x: along the text, y: up, t: 0..eff_depth+eff_overshoot through the wall (t=eff_depth is the surface)
         x, y, t = v[:, 0], v[:, 1], v[:, 2]
         theta = front_angle + x / R          # arc length measured on the outer wall
         z = y + y_shift
         # point on the actual surface (follows the rounded top edge) ...
         r_s = np.interp(z, base.prof_z, base.prof_r)
         dr = np.interp(z, base.prof_z, base.prof_dr)
-        # ... offset along the surface normal, so the cut is DEPTH deep everywhere
+        # ... offset along the surface normal, so the cut is DEPTH deep everywhere after scaling
         n_len = np.sqrt(1.0 + dr * dr)
         n_r, n_z = 1.0 / n_len, -dr / n_len
-        s = t - DEPTH
+        s = t - eff_depth
         rad = r_s + s * n_r
         out = np.empty_like(v)
         out[:, 0] = -rad * np.sin(theta)     # reads left-to-right when viewed from front_angle
@@ -300,18 +350,35 @@ def _records_to_stl_bytes(rec: np.ndarray, header_text: str) -> bytes:
     return buf.getvalue()
 
 
-def _transform_base_records_to_cat_space(rec: np.ndarray, z_shift: float, xy_shift: float = 0.0) -> np.ndarray:
-    """Apply the exact rigid transform that maps Base with Screw2.stl into Cat STL space:
-    (x, y, z) -> (y + xy_shift, -x + xy_shift, z + z_shift).
+def _transform_base_records_to_cat_space(rec: np.ndarray, z_shift: float, xy_shift: float = 0.0,
+                                         scale_factor: float = 1.0) -> np.ndarray:
+    """Map Base with Screw2.stl into Cat STL space, scaled uniformly by `scale_factor`
+    around the base bottom-center (so Z >= 0 sits on the build plate and XY is centered at xy_shift).
     """
     out = rec.copy()
-    vx, vy = out["v"][:, :, 0].copy(), out["v"][:, :, 1].copy()
-    out["v"][:, :, 0] = vy + xy_shift
-    out["v"][:, :, 1] = -vx + xy_shift
-    out["v"][:, :, 2] += z_shift
+    s = np.float32(scale_factor)
+    vx, vy, vz = out["v"][:, :, 0].copy(), out["v"][:, :, 1].copy(), out["v"][:, :, 2].copy()
+    out["v"][:, :, 0] = s * vy + xy_shift
+    out["v"][:, :, 1] = -s * vx + xy_shift
+    out["v"][:, :, 2] = s * (vz + np.float32(z_shift))
     nx, ny = out["n"][:, 0].copy(), out["n"][:, 1].copy()
     out["n"][:, 0] = ny
     out["n"][:, 1] = -nx
+    return out
+
+
+def _scale_cat_records(rec: np.ndarray, scale_factor: float, orig_center_xy: float = 128.0,
+                       target_center_xy: float = 128.0) -> np.ndarray:
+    """Uniformly scale Cat STL records by `scale_factor` around (orig_center_xy, orig_center_xy, 0),
+    placing the result at (target_center_xy, target_center_xy, 0). Unit normals are unchanged by uniform scaling.
+    """
+    if abs(scale_factor - 1.0) < 1e-6 and abs(orig_center_xy - target_center_xy) < 1e-6:
+        return rec
+    out = rec.copy()
+    s = np.float32(scale_factor)
+    out["v"][:, :, 0] = s * (out["v"][:, :, 0] - orig_center_xy) + target_center_xy
+    out["v"][:, :, 1] = s * (out["v"][:, :, 1] - orig_center_xy) + target_center_xy
+    out["v"][:, :, 2] = s * out["v"][:, :, 2]
     return out
 
 
@@ -341,15 +408,19 @@ def get_base() -> Base:
         return _base
 
 
-def engrave(text: str, preview: bool = False, model: str = "cat") -> tuple[str, bytes]:
+def engrave(text: str, preview: bool = False, model: str = "cat",
+            weight_kg: float | None = None) -> tuple[str, bytes, dict]:
     text = normalise_text(text)
+    sizing = sizing_for_weight(weight_kg)
+    scale_factor = sizing["scale"]
+
     base = get_base()
     if model == "cat" and not base.has_cat:
         raise EngraveError(f"Cat model file not found: {CAT_STL.name}")
 
     t = time.time()
     front_angle = base.cat_front_angle if model == "cat" else FRONT_ANGLE
-    cutter = build_cutter(text, base, front_angle=front_angle, arc_dir=1.0)
+    cutter = build_cutter(text, base, front_angle=front_angle, scale_factor=scale_factor)
     target = base.preview if preview else base.manifold
     with _LOCK:
         result = target - cutter
@@ -357,40 +428,59 @@ def engrave(text: str, preview: bool = False, model: str = "cat") -> tuple[str, 
 
     if model == "cat":
         if preview:
-            # In preview: centre at (0, 0) and rotate so the cat & engraving face +Y (towards the camera)
-            base_cat = _transform_base_records_to_cat_space(base_rec, z_shift=base.cat_z_shift, xy_shift=0.0)
-            combined = np.concatenate([base.cat_preview_records, base_cat])
+            # In preview: centre at (0, 0), Z >= 0, scaled by `scale_factor`, rotated to face +Y
+            base_cat = _transform_base_records_to_cat_space(
+                base_rec, z_shift=base.cat_z_shift, xy_shift=0.0, scale_factor=scale_factor
+            )
+            cat_prev = _scale_cat_records(
+                base.cat_preview_records, scale_factor=scale_factor, orig_center_xy=0.0, target_center_xy=0.0
+            )
+            combined = np.concatenate([cat_prev, base_cat])
             rot_to_plus_y = (np.pi / 2) - base.cat_text_azimuth_rad
             combined = _rotate_cat_records_to_front(combined, rot_to_plus_y, center_xy=0.0)
-            data = _records_to_stl_bytes(combined, f"Preview Cat Urn: {text}")
+            data = _records_to_stl_bytes(combined, f"Preview Cat Urn: {text} ({sizing['weightKg']}kg)")
             n_tris = len(combined)
         else:
-            # Full export: exact original Cat STL coordinate space and untouched cat/disc shells
-            base_cat = _transform_base_records_to_cat_space(base_rec, z_shift=base.cat_z_shift, xy_shift=128.0)
-            total_tris = len(base.cat_body_records) + len(base_cat) + len(base.cat_disc_records)
+            # Full export: scaled around (128, 128, 0) so it stays centered on the build plate at Z >= 0
+            base_cat = _transform_base_records_to_cat_space(
+                base_rec, z_shift=base.cat_z_shift, xy_shift=128.0, scale_factor=scale_factor
+            )
+            cat_body = _scale_cat_records(
+                base.cat_body_records, scale_factor=scale_factor, orig_center_xy=128.0, target_center_xy=128.0
+            )
+            cat_disc = _scale_cat_records(
+                base.cat_disc_records, scale_factor=scale_factor, orig_center_xy=128.0, target_center_xy=128.0
+            )
+            total_tris = len(cat_body) + len(base_cat) + len(cat_disc)
             buf = io.BytesIO()
-            buf.write(f"Engraved Cat Urn: {text}".encode("ascii", "replace")[:80].ljust(80, b" "))
+            buf.write(f"Engraved Cat Urn: {text} ({sizing['weightKg']}kg)".encode("ascii", "replace")[:80].ljust(80, b" "))
             buf.write(struct.pack("<I", total_tris))
-            buf.write(base.cat_body_records.tobytes())
+            buf.write(cat_body.tobytes())
             buf.write(base_cat.tobytes())
-            buf.write(base.cat_disc_records.tobytes())
+            buf.write(cat_disc.tobytes())
             data = buf.getvalue()
             n_tris = total_tris
     else:
-        data = _records_to_stl_bytes(base_rec, f"Engraved base: {text}")
+        # Standalone base: scale uniformly around (0, 0, z_min) so its bottom stays at z_min * scale_factor
+        if abs(scale_factor - 1.0) > 1e-6:
+            base_rec = base_rec.copy()
+            base_rec["v"] *= np.float32(scale_factor)
+        data = _records_to_stl_bytes(base_rec, f"Engraved base: {text} ({sizing['weightKg']}kg)")
         n_tris = len(base_rec)
 
-    print(f"[engrave] {model} {'preview' if preview else 'full'} '{text}': "
+    print(f"[engrave] {model} {'preview' if preview else 'full'} '{text}' "
+          f"({sizing['weightKg']}kg -> {sizing['capacityMl']}mL, scale={scale_factor:.3f}): "
           f"{n_tris:,} tris, {len(data) / 1e6:.1f} MB, {time.time() - t:.1f}s")
-    return text, data
+    return text, data, sizing
 
 
-if __name__ == "__main__":  # quick CLI test:  python engraver.py "Charlie" [cat|base]
+if __name__ == "__main__":  # quick CLI test:  python engraver.py "Charlie" [cat|base] [weight_kg]
     import sys
     arg_text = sys.argv[1] if len(sys.argv) > 1 else "Charlie"
     arg_model = sys.argv[2] if len(sys.argv) > 2 else "cat"
-    name, stl = engrave(arg_text, model=arg_model)
+    arg_weight = float(sys.argv[3]) if len(sys.argv) > 3 else DEFAULT_WEIGHT_KG
+    name, stl, info = engrave(arg_text, model=arg_model, weight_kg=arg_weight)
     prefix = "Cat_Urn" if arg_model == "cat" else "Base"
-    out = Path(__file__).with_name(f"{prefix}_{name.replace(' ', '_')}.stl")
+    out = Path(__file__).with_name(f"{prefix}_{name.replace(' ', '_')}_{info['weightKg']}kg.stl")
     out.write_bytes(stl)
-    print("wrote", out)
+    print("wrote", out, info)

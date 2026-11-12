@@ -30,6 +30,8 @@ def _current_engraver():
                 v = cached_base.manifold.to_mesh().vert_properties[:, :3].astype("float64")
                 r = (v[:, 0] ** 2 + v[:, 1] ** 2) ** 0.5
                 cached_base._outer_profile(v[:, 2], r)
+            if not hasattr(cached_base, "orig_height"):
+                cached_base.orig_height = cached_base.z_max - cached_base.z_min
             cached_base.preview = cached_base._preview_shape()
             if not hasattr(cached_base, "has_cat"):
                 cached_base.has_cat = engraver.CAT_STL.exists()
@@ -65,6 +67,11 @@ class Handler(BaseHTTPRequestHandler):
                 "ready": ready,
                 "hasCat": has_cat,
                 "maxChars": eng.MAX_CHARS,
+                "defaultWeightKg": eng.DEFAULT_WEIGHT_KG,
+                "minWeightKg": eng.MIN_WEIGHT_KG,
+                "maxWeightKg": eng.MAX_WEIGHT_KG,
+                "mlPerKg": eng.ML_PER_KG,
+                "origCapacityMl": eng.ORIG_CAPACITY_ML,
             }).encode(), "application/json")
         else:
             self._error(404, "Not found")
@@ -80,18 +87,25 @@ class Handler(BaseHTTPRequestHandler):
             model = payload.get("model", "cat")
             if model not in ("cat", "base"):
                 model = "cat"
-            name, data = eng.engrave(text, preview=self.path == "/api/preview", model=model)
+            weight_kg = payload.get("weightKg", eng.DEFAULT_WEIGHT_KG)
+            name, data, sizing = eng.engrave(
+                text, preview=self.path == "/api/preview", model=model, weight_kg=weight_kg
+            )
         except eng.EngraveError as e:
             return self._error(400, str(e))
         except Exception as e:  # unexpected
             print("[error]", repr(e))
             return self._error(500, f"Engraving failed: {e}")
         prefix = "Cat_Urn" if model == "cat" else "Base"
-        filename = f"{prefix}_{name.replace(' ', '_')}.stl"
+        w_tag = f"{sizing['weightKg']:g}kg"
+        filename = f"{prefix}_{name.replace(' ', '_')}_{w_tag}.stl"
         self._send(200, data, "model/stl", {
             "Content-Disposition": "attachment; filename*=UTF-8''" + urllib.parse.quote(filename),
             "X-Text": urllib.parse.quote(name),
             "X-Model": model,
+            "X-Weight-Kg": str(sizing["weightKg"]),
+            "X-Capacity-Ml": str(sizing["capacityMl"]),
+            "X-Scale": f"{sizing['scale']:.4f}",
         })
 
     def log_message(self, fmt, *args):
