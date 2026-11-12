@@ -30,7 +30,7 @@ The preview loads three.js from a CDN, so the browser needs internet access.
 |---|---|
 | Font | `C:\Windows\Fonts\arial.ttf`, text forced to UPPERCASE |
 | `CAP_HEIGHT` | 10 mm (capitals centred on the full 11.8 mm height) |
-| `DEPTH` | 1 mm, cut to a fixed radius (R 49.68 → 48.68) |
+| `DEPTH` | 1 mm, measured along the surface normal, so the cut is a uniform 1 mm deep on the flat wall and on the rounded top edge |
 | `MAX_CHARS` | 15 |
 | `FRONT_ANGLE` | 0 = centred on the +Y side |
 
@@ -39,7 +39,8 @@ Characters that would run past the top or bottom edge at 10 mm (accented capital
 
 ## How it works
 1. Text → Arial outline (matplotlib `TextPath`) → 2D cross-section
-2. Extrude 2 mm, refine, then wrap it around the cylinder (`manifold3d` `warp_batch`)
+2. Extrude 2 mm, refine, then wrap it onto the measured outer-wall profile r(z),
+   offsetting along the surface normal (`manifold3d` `warp_batch`)
 3. Boolean subtraction from the original mesh (manifold3d). Geometry away from the
    text is left unchanged.
 4. Export a binary STL

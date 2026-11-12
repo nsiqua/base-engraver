@@ -22,7 +22,7 @@ from matplotlib.textpath import TextPath
 BASE_STL = Path(__file__).with_name("Base with Screw2.stl")
 FONT_FILE = Path(r"C:\Windows\Fonts\arial.ttf")
 CAP_HEIGHT = 10.0      # mm, height of capital letters (user choice "B")
-DEPTH = 1.0            # mm, cut depth measured from the cylindrical outer wall
+DEPTH = 1.0            # mm, cut depth measured along the surface normal (uniform, incl. rounded top edge)
 MAX_CHARS = 15
 OVERSHOOT = 1.0        # mm the cutter sticks out beyond the wall (clean cut)
 EDGE_MARGIN = 0.05     # mm, letters must stay at least this far from top/bottom faces
@@ -54,9 +54,30 @@ class Base:
         self.r_outer = float(r.max())
         self.z_min = float(v[:, 2].min())
         self.z_max = float(v[:, 2].max())
+        self._outer_profile(v[:, 2], r)
         self.preview = self._preview_shape(v[:, 2], r)
         print(f"[base] loaded {self.manifold.num_tri():,} triangles in {time.time() - t:.1f}s; "
               f"R={self.r_outer:.3f} Z={self.z_min:.3f}..{self.z_max:.3f}")
+
+    def _outer_profile(self, z: np.ndarray, r: np.ndarray) -> None:
+        """Measure the outer wall profile r(z), including the rounded top edge.
+
+        The mesh vertices lie on rings at discrete Z levels; the largest radius on each
+        level is the true surface radius there. The result is resampled to a uniform
+        0.01 mm grid, together with its slope dr/dz (used for the surface normal).
+        """
+        m = r > self.r_outer - 2.0
+        zl = np.round(z[m], 3)
+        order = np.argsort(zl, kind="stable")
+        zl, rl = zl[order], r[m][order]
+        levels, start = np.unique(zl, return_index=True)
+        rmax = np.maximum.reduceat(rl, start)
+        self.prof_z = np.arange(self.z_min, self.z_max + 1e-9, 0.01)
+        self.prof_r = np.interp(self.prof_z, levels, rmax)
+        # light smoothing before differentiating (5-sample moving average)
+        k = np.ones(5) / 5
+        smooth = np.convolve(np.pad(self.prof_r, 2, mode="edge"), k, mode="valid")
+        self.prof_dr = np.gradient(smooth, self.prof_z)
 
     def _preview_shape(self, z: np.ndarray, r: np.ndarray) -> m3d.Manifold:
         """Light-weight revolved approximation of the base, for the browser preview only."""
@@ -127,17 +148,25 @@ def build_cutter(text: str, base: Base) -> m3d.Manifold:
     section = m3d.CrossSection(polys, m3d.FillRule.NonZero)
     solid = section.extrude(DEPTH + OVERSHOOT).refine_to_length(REFINE_LEN)
 
-    r_in = base.r_outer - DEPTH
     R = base.r_outer
 
     def wrap(v: np.ndarray) -> np.ndarray:
+        # x: along the text, y: up, t: 0..DEPTH+OVERSHOOT through the wall (t=DEPTH is the surface)
         x, y, t = v[:, 0], v[:, 1], v[:, 2]
         theta = FRONT_ANGLE + x / R          # arc length measured on the outer wall
-        rad = r_in + t
+        z = y + y_shift
+        # point on the actual surface (follows the rounded top edge) ...
+        r_s = np.interp(z, base.prof_z, base.prof_r)
+        dr = np.interp(z, base.prof_z, base.prof_dr)
+        # ... offset along the surface normal, so the cut is DEPTH deep everywhere
+        n_len = np.sqrt(1.0 + dr * dr)
+        n_r, n_z = 1.0 / n_len, -dr / n_len
+        s = t - DEPTH
+        rad = r_s + s * n_r
         out = np.empty_like(v)
         out[:, 0] = -rad * np.sin(theta)     # reads left-to-right when viewed from +Y
         out[:, 1] = rad * np.cos(theta)
-        out[:, 2] = y + y_shift
+        out[:, 2] = z + s * n_z
         return out
 
     return solid.warp_batch(wrap)
